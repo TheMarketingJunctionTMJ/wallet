@@ -1,5 +1,6 @@
 import time
 from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
 import requests
 import streamlit as st
@@ -10,7 +11,10 @@ st.set_page_config(
     layout="wide",
 )
 
-COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+COINS_LIST_URL = f"{COINGECKO_BASE}/coins/list"
+SIMPLE_PRICE_URL = f"{COINGECKO_BASE}/simple/price"
+MARKETS_URL = f"{COINGECKO_BASE}/coins/markets"
 
 CUSTOM_CSS = """
 <style>
@@ -123,10 +127,6 @@ CUSTOM_CSS = """
     div[data-baseweb="select"] > div {
         border-radius: 12px !important;
     }
-    .stButton > button {
-        border-radius: 12px;
-        font-weight: 600;
-    }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -138,6 +138,18 @@ def now_utc() -> str:
 
 def fmt_money(value: float, digits: int = 4) -> str:
     return f"${value:,.{digits}f}"
+
+
+def get_demo_key() -> str:
+    return st.secrets.get("COINGECKO_DEMO_API_KEY", "")
+
+
+def cg_headers() -> Dict[str, str]:
+    demo_key = get_demo_key()
+    headers = {"accept": "application/json"}
+    if demo_key:
+        headers["x-cg-demo-api-key"] = demo_key
+    return headers
 
 
 def calculate_pnl(side: str, entry_price: float, current_price: float, quantity: float):
@@ -163,49 +175,74 @@ def render_pnl_box(pnl_value: float):
         st.markdown(f'<div class="neutral-box">{fmt_money(pnl_value)}</div>', unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_markets(vs_currency: str = "usd", per_page: int = 250):
-    all_rows = []
-    for page in range(1, 5):
-        params = {
-            "vs_currency": vs_currency,
-            "order": "market_cap_desc",
-            "per_page": per_page,
-            "page": page,
-            "sparkline": "false",
-            "price_change_percentage": "24h",
-        }
-        response = requests.get(COINGECKO_MARKETS_URL, params=params, timeout=20)
-        response.raise_for_status()
-        rows = response.json()
-        if not rows:
-            break
-        all_rows.extend(rows)
-    return all_rows
+def safe_get(url: str, params: Optional[Dict] = None) -> requests.Response:
+    response = requests.get(url, params=params, headers=cg_headers(), timeout=20)
+    response.raise_for_status()
+    return response
 
 
-try:
-    market_rows = fetch_markets()
-except Exception as exc:
-    st.error(f"Could not load crypto market data: {exc}")
-    st.stop()
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_coin_list() -> List[Dict]:
+    response = safe_get(COINS_LIST_URL)
+    rows = response.json()
 
-coin_options = []
-coin_map = {}
+    # Deduplicate by id and keep simple label
+    seen = set()
+    cleaned = []
+    for row in rows:
+        coin_id = row.get("id")
+        symbol = (row.get("symbol") or "").upper()
+        name = row.get("name") or ""
+        if not coin_id or coin_id in seen:
+            continue
+        seen.add(coin_id)
+        cleaned.append(
+            {
+                "id": coin_id,
+                "symbol": symbol,
+                "name": name,
+                "label": f"{symbol} — {name}",
+            }
+        )
 
-for row in market_rows:
-    label = f"{row['symbol'].upper()} — {row['name']}"
-    coin_options.append(label)
-    coin_map[label] = row
+    cleaned.sort(key=lambda x: (x["symbol"], x["name"]))
+    return cleaned
 
-default_label = next((x for x in coin_options if x.startswith("BTC ")), coin_options[0])
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_top_markets(vs_currency: str = "usd", per_page: int = 50) -> List[Dict]:
+    params = {
+        "vs_currency": vs_currency,
+        "order": "market_cap_desc",
+        "per_page": per_page,
+        "page": 1,
+        "sparkline": "false",
+        "price_change_percentage": "24h",
+    }
+    response = safe_get(MARKETS_URL, params=params)
+    return response.json()
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_selected_price(coin_id: str, vs_currency: str = "usd") -> Dict:
+    params = {
+        "ids": coin_id,
+        "vs_currencies": vs_currency,
+        "include_24hr_change": "true",
+        "include_market_cap": "true",
+        "include_last_updated_at": "true",
+    }
+    response = safe_get(SIMPLE_PRICE_URL, params=params)
+    data = response.json()
+    return data.get(coin_id, {})
+
 
 st.markdown(
     """
     <div class="hero">
         <div class="eyebrow">Live Crypto Price Tracker</div>
         <h1>Crypto P&L Dashboard</h1>
-        <p>Track live market prices, enter your long or short position, and monitor real-time profit and loss on Streamlit Cloud.</p>
+        <p>Track live prices, enter your long or short position, and monitor real-time profit and loss with a lighter API footprint.</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -214,22 +251,66 @@ st.markdown(
 with st.sidebar:
     st.title("Settings")
     auto_refresh = st.checkbox("Auto-refresh", value=True)
-    refresh_seconds = st.selectbox("Refresh every", [5, 10, 15, 30, 60], index=1)
+    refresh_seconds = st.selectbox("Refresh every", [10, 15, 30, 60], index=1)
     search_text = st.text_input("Search coin", placeholder="BTC, ETH, SOL")
     st.markdown("---")
-    st.caption("Data source: CoinGecko market data")
-    st.caption("This version supports long and short P&L.")
-    st.caption("It does not calculate exchange fees, leverage, or liquidation.")
+    if get_demo_key():
+        st.success("CoinGecko demo key detected.")
+    else:
+        st.warning("No CoinGecko demo key found. Public access may hit rate limits on Streamlit Cloud.")
+    st.caption("Optional Streamlit secret:")
+    st.code('COINGECKO_DEMO_API_KEY = "your_demo_key_here"', language="toml")
 
-filtered_options = [
-    option for option in coin_options
-    if search_text.strip().lower() in option.lower()
-] or coin_options
+try:
+    coin_list = fetch_coin_list()
+    top_markets = fetch_top_markets()
+except requests.HTTPError as exc:
+    if exc.response is not None and exc.response.status_code == 429:
+        st.error(
+            "CoinGecko rate limit hit. Add a CoinGecko demo key in Streamlit Secrets and redeploy, "
+            "or turn off auto-refresh and wait a minute."
+        )
+    else:
+        st.error(f"Could not load crypto market data: {exc}")
+    st.stop()
+except Exception as exc:
+    st.error(f"Could not load crypto market data: {exc}")
+    st.stop()
+
+filtered_coins = [
+    coin for coin in coin_list
+    if search_text.strip().lower() in coin["label"].lower()
+] or coin_list
+
+default_label = next((c["label"] for c in filtered_coins if c["symbol"] == "BTC"), filtered_coins[0]["label"])
+selected_label = st.session_state.get("selected_label", default_label)
+
+label_to_coin = {coin["label"]: coin for coin in filtered_coins}
+if selected_label not in label_to_coin:
+    selected_label = filtered_coins[0]["label"]
+
+selected_coin = label_to_coin[selected_label]
+
+try:
+    selected_price = fetch_selected_price(selected_coin["id"])
+except requests.HTTPError as exc:
+    if exc.response is not None and exc.response.status_code == 429:
+        st.error(
+            "CoinGecko rate limit hit while fetching the selected coin. "
+            "Try again shortly, reduce refresh frequency, or use a CoinGecko demo key."
+        )
+    else:
+        st.error(f"Could not load selected coin price: {exc}")
+    st.stop()
+
+current_price = float(selected_price.get("usd", 0.0))
+change_24h = float(selected_price.get("usd_24h_change", 0.0) or 0.0)
+market_cap = float(selected_price.get("usd_market_cap", 0.0) or 0.0)
 
 m1, m2, m3, m4 = st.columns(4)
 with m1:
     st.markdown(
-        f'<div class="metric-card"><div class="metric-label">Coins Loaded</div><div class="metric-value">{len(market_rows):,}</div></div>',
+        f'<div class="metric-card"><div class="metric-label">Coins Loaded</div><div class="metric-value">{len(coin_list):,}</div></div>',
         unsafe_allow_html=True,
     )
 with m2:
@@ -257,14 +338,21 @@ with left:
     st.subheader("Your Position")
 
     position_side = st.radio("Position side", ["Long", "Short"], horizontal=True)
-    selected_label = st.selectbox(
+    chosen_label = st.selectbox(
         "Crypto",
-        filtered_options,
-        index=filtered_options.index(default_label) if default_label in filtered_options else 0,
+        [coin["label"] for coin in filtered_coins],
+        index=[coin["label"] for coin in filtered_coins].index(selected_label),
     )
-    selected = coin_map[selected_label]
+    st.session_state["selected_label"] = chosen_label
+    selected_coin = label_to_coin[chosen_label]
 
-    current_price = float(selected.get("current_price") or 0.0)
+    # Re-fetch only if changed after initial load
+    if selected_coin["id"] != coin_list[[c["label"] for c in coin_list].index(selected_label)]["id"]:
+        selected_price = fetch_selected_price(selected_coin["id"])
+        current_price = float(selected_price.get("usd", 0.0))
+        change_24h = float(selected_price.get("usd_24h_change", 0.0) or 0.0)
+        market_cap = float(selected_price.get("usd_market_cap", 0.0) or 0.0)
+
     quantity = st.number_input("Quantity", min_value=0.0, value=1.0, step=0.001, format="%.6f")
     entry_price = st.number_input("Entry price", min_value=0.0, value=current_price, step=0.01, format="%.8f")
 
@@ -285,7 +373,6 @@ with left:
             unsafe_allow_html=True,
         )
     with c2:
-        change_24h = float(selected.get("price_change_percentage_24h") or 0.0)
         st.markdown(
             f"""
             <div class="small-card">
@@ -314,25 +401,28 @@ with left:
         st.metric("Current Value", fmt_money(current_value, 4))
         st.metric("Position Side", position_side)
     with p4:
-        st.metric("Market Cap Rank", f"#{selected.get('market_cap_rank', '-')}")
+        st.metric("Market Cap", fmt_money(market_cap, 0))
         st.metric("Raw Price Move", fmt_money(raw_move, 6))
-        st.metric("Symbol", selected.get("symbol", "").upper())
+        st.metric("Symbol", selected_coin["symbol"])
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 with right:
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("Live Market Table")
+    st.subheader("Top Market Table")
 
     table_rows = []
-    for row in market_rows:
-        if search_text.strip() and search_text.strip().lower() not in f"{row['symbol']} {row['name']}".lower():
+    search_lower = search_text.strip().lower()
+
+    for row in top_markets:
+        text = f"{row.get('symbol', '')} {row.get('name', '')}".lower()
+        if search_lower and search_lower not in text:
             continue
         table_rows.append(
             {
-                "Symbol": row["symbol"].upper(),
-                "Name": row["name"],
-                "Price": row["current_price"],
+                "Symbol": (row.get("symbol") or "").upper(),
+                "Name": row.get("name"),
+                "Price": row.get("current_price"),
                 "24h %": row.get("price_change_percentage_24h"),
                 "Market Cap Rank": row.get("market_cap_rank"),
             }
@@ -352,7 +442,8 @@ with right:
 
 st.markdown("")
 st.caption(
-    "This app uses CoinGecko live crypto market data and calculates simple unrealized P&L for long and short positions. It does not include fees, leverage, liquidation, or exchange-specific futures mechanics."
+    "This version uses a lower-request design: cached coin list, one top-market request, and one selected-price request. "
+    "It supports long and short unrealized P&L, but not leverage, fees, or liquidation logic."
 )
 
 if auto_refresh:
